@@ -1,0 +1,85 @@
+name: xcframework CI
+on:
+  pull_request:
+    paths-ignore:
+      - '**.md'
+      - '**.mkd'
+  workflow_dispatch:
+  push:
+    tags:
+      - 'ver.*'
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v7
+      - name: Toolchain and resources
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          xcrun --sdk iphonesimulator --show-sdk-version
+          uv --version
+          df -h .
+          sysctl hw.memsize
+          sysctl vm.swapusage
+      - name: Build pinned products
+        run: |
+          nice -n 15 bash ios_compile
+      - name: Audit final consumer ZIPs
+        run: |
+          set -euo pipefail
+          zips=(.build/*.xcframework.zip)
+          test -f "${zips[0]}"
+          test "${#zips[@]}" = 1
+          test "${zips[0]}" = .build/vimproc.xcframework.zip
+          test -s .build/release.md
+          : > .build/checksums.txt
+          for zip in "${zips[@]}"; do
+            sum=$(swift package compute-checksum "$zip")
+            printf '%s  %s\n' "$sum" "$(basename "$zip")" >> .build/checksums.txt
+            uv run ci/audit-artifact.py "$zip" --sha256 "$sum" --max-minos 14.0 > "$zip.audit.json"
+          done
+      - uses: actions/upload-artifact@v7
+        with:
+          name: xcframeworks
+          include-hidden-files: true
+          if-no-files-found: error
+          path: |
+            .build/*.xcframework.zip
+            .build/*.audit.json
+            .build/vimproc.exports-audit.txt
+            .build/checksums.txt
+            .build/release.md
+  release:
+    needs: build
+    if: github.repository == 'holzschu/vimproc.vim' && startsWith(github.ref, 'refs/tags/ver.')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: xcframeworks
+          path: dist
+      - name: Publish immutable assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd dist
+          shasum -a 256 -c checksums.txt
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" ./*.xcframework.zip checksums.txt
+          else
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --latest=false \
+              --title "Release $GITHUB_REF_NAME" --notes-file release.md ./*.xcframework.zip checksums.txt
+          fi
